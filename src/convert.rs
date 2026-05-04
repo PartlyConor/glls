@@ -97,10 +97,9 @@ pub fn discussions_to_diagnostics(
 // Changed-file diagnostics (HINT on line 0 of every diff'd file)
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Produce a single HINT diagnostic at line 0 for each file touched by the MR.
-/// This makes all changed files immediately visible in Helix's diagnostics
-/// picker (`<space>d`) as soon as the MR data is loaded.
-pub fn diffs_to_changed_file_diagnostics(mr_label: &str) -> Diagnostic {
+/// Produce a single diagnostic at line 0 for each file touched by the MR.
+/// Severity is HINT when the file has been marked seen, INFO otherwise.
+pub fn diffs_to_changed_file_diagnostics(mr_label: &str, seen: bool) -> Diagnostic {
     Diagnostic {
         range: Range {
             start: Position {
@@ -112,9 +111,17 @@ pub fn diffs_to_changed_file_diagnostics(mr_label: &str) -> Diagnostic {
                 character: 0,
             },
         },
-        severity: Some(DiagnosticSeverity::HINT),
+        severity: Some(if seen {
+            DiagnosticSeverity::HINT
+        } else {
+            DiagnosticSeverity::INFORMATION
+        }),
         source: Some("gitlab-mr".to_owned()),
-        message: format!("Changed in {mr_label}"),
+        message: if seen {
+            format!("Seen — changed in {mr_label}")
+        } else {
+            format!("Changed in {mr_label}")
+        },
         ..Default::default()
     }
 }

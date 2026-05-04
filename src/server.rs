@@ -39,6 +39,22 @@ fn uri_to_repo_path(uri: &Url, repo_root: &PathBuf) -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Normalise a `file` argument that may be either a repo-relative path (from a
+/// code action) or an absolute path (from `:lsp-workspace-command
+/// %{buffer_name}`). Returns the repo-relative string, or the original value
+/// unchanged if it is already relative / stripping fails.
+fn resolve_file_arg(file: &str, repo_root: &PathBuf) -> String {
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        p.strip_prefix(repo_root)
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_owned())
+    } else {
+        file.to_owned()
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Background polling task
 // ──────────────────────────────────────────────────────────────────────────────
@@ -56,18 +72,13 @@ async fn refresh_loop(client: Client, state: SharedState) {
         };
 
         if config.gitlab_token.is_empty() {
-            let mut s = state.write().await;
-            if !s.notified_no_token {
-                s.notified_no_token = true;
-                client
-                    .show_message(
-                        MessageType::WARNING,
-                        "gitlab-mr-lsp: no GitLab token found. Set GITLAB_TOKEN or run `glab auth login`.",
-                    )
-                    .await;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(poll_secs)).await;
-            continue;
+            client
+                .show_message(
+                    MessageType::WARNING,
+                    "gitlab-mr-lsp: no GitLab token found. Set GITLAB_TOKEN or run `glab auth login`. LSP will not poll.",
+                )
+                .await;
+            return;
         }
 
         let gl = GitLabClient::new(&config.gitlab_host, &config.gitlab_token);
@@ -183,23 +194,25 @@ async fn refresh_loop(client: Client, state: SharedState) {
         }
 
         // Push diagnostics
-        let (repo_root, new_by_file, diff_refs, mr_label, new_diff_files) = {
+        let (repo_root, new_by_file, diff_refs, mr_label, new_diff_files, head_sha, seen_files) = {
             let s = state.read().await;
             let refs = s.mr.as_ref().and_then(|m| m.diff_refs.clone());
             let label = s.mr.as_ref()
                 .map(|m| format!("MR !{}", m.iid))
                 .unwrap_or_default();
+            let head_sha = s.mr.as_ref().and_then(|m| m.diff_refs.as_ref()).map(|r| r.head_sha.clone()).unwrap_or_default();
             let diff_paths: HashSet<String> = s.diffs.iter().map(|d| d.new_path.clone()).collect();
-            (s.repo_root.clone(), s.discussions_by_file.clone(), refs, label, diff_paths)
+            let seen = s.seen_files.clone();
+            (s.repo_root.clone(), s.discussions_by_file.clone(), refs, label, diff_paths, head_sha, seen)
         };
 
         // For every changed file: publish the "Changed in MR !N" hint merged
         // with any discussion diagnostics for that file.
-        let changed_hint = convert::diffs_to_changed_file_diagnostics(&mr_label);
         for file_path in &new_diff_files {
+            let is_seen = seen_files.get(file_path).map(|sha| *sha == head_sha).unwrap_or(false);
             let abs = repo_root.join(file_path);
             if let Ok(uri) = Url::from_file_path(&abs) {
-                let mut diags = vec![changed_hint.clone()];
+                let mut diags = vec![convert::diffs_to_changed_file_diagnostics(&mr_label, is_seen)];
                 if let Some(discussions) = new_by_file.get(file_path) {
                     diags.extend(convert::discussions_to_diagnostics(
                         discussions,
@@ -499,12 +512,16 @@ impl Backend {
     }
 
     async fn handle_view_diff(&self, args: Vec<Value>) -> LspResult<Option<Value>> {
-        let file_path = args
+        let raw_file = args
             .first()
             .and_then(|v| v.get("file"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
+        let file_path = {
+            let s = self.state.read().await;
+            resolve_file_arg(&raw_file, &s.repo_root)
+        };
 
         let (diff_content, mr_iid) = {
             let s = self.state.read().await;
@@ -580,18 +597,91 @@ impl Backend {
         Ok(None)
     }
 
-    async fn handle_approve(&self) -> LspResult<Option<Value>> {
-        let (config, project_path, mr_iid) = snap_config_mr(&self.state).await?;
-        let gl = GitLabClient::new(&config.gitlab_host, &config.gitlab_token);
+    async fn handle_mark_seen(&self, args: Vec<Value>) -> LspResult<Option<Value>> {
+        let raw_file = args
+            .first()
+            .and_then(|v| v.get("file"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let file_path = {
+            let s = self.state.read().await;
+            resolve_file_arg(&raw_file, &s.repo_root)
+        };
 
-        match gl.approve_mr(&project_path, mr_iid).await {
+        let (repo_root, discussions, diff_refs, mr_label, now_seen) = {
+            let mut s = self.state.write().await;
+            let head_sha = s.mr.as_ref()
+                .and_then(|m| m.diff_refs.as_ref())
+                .map(|r| r.head_sha.clone())
+                .unwrap_or_default();
+
+            // Toggle: if already seen at this SHA, remove it; otherwise mark it.
+            let currently_seen = s.seen_files.get(&file_path).map(|sha| *sha == head_sha).unwrap_or(false);
+            if currently_seen {
+                s.seen_files.remove(&file_path);
+            } else {
+                s.seen_files.insert(file_path.clone(), head_sha);
+            }
+            let now_seen = !currently_seen;
+
+            let refs = s.mr.as_ref().and_then(|m| m.diff_refs.clone());
+            let label = s.mr.as_ref().map(|m| format!("MR !{}", m.iid)).unwrap_or_default();
+            let ds = s.discussions_by_file.get(&file_path).cloned().unwrap_or_default();
+            (s.repo_root.clone(), ds, refs, label, now_seen)
+        };
+
+        // Re-publish diagnostics for this file with updated severity.
+        let abs = repo_root.join(&file_path);
+        if let Ok(uri) = Url::from_file_path(&abs) {
+            let mut diags = vec![convert::diffs_to_changed_file_diagnostics(&mr_label, now_seen)];
+            diags.extend(convert::discussions_to_diagnostics(&discussions, &file_path, diff_refs.as_ref()));
+            self.client.publish_diagnostics(uri, diags, None).await;
+        }
+
+        Ok(None)
+    }
+
+    async fn handle_approve(&self) -> LspResult<Option<Value>> {
+        let (config, project_path, mr_iid, mr_title) = {
+            let s = self.state.read().await;
+            let cfg = s.config.clone().ok_or_else(|| tower_lsp::jsonrpc::Error::internal_error())?;
+            let mr = s.mr.as_ref().ok_or_else(|| tower_lsp::jsonrpc::Error::internal_error())?;
+            (cfg, s.project_path.clone(), mr.iid, mr.title.clone())
+        };
+
+        let chosen = self.client.show_message_request(
+            MessageType::WARNING,
+            format!("MR !{mr_iid}: {mr_title}"),
+            Some(vec![
+                MessageActionItem { title: "Approve".to_owned(), properties: Default::default() },
+                MessageActionItem { title: "Unapprove".to_owned(), properties: Default::default() },
+                MessageActionItem { title: "Cancel".to_owned(), properties: Default::default() },
+            ]),
+        ).await.unwrap_or(None);
+
+        let action = match chosen.as_ref().map(|a| a.title.as_str()) {
+            Some("Approve") => true,
+            Some("Unapprove") => false,
+            _ => return Ok(None),
+        };
+
+        let gl = GitLabClient::new(&config.gitlab_host, &config.gitlab_token);
+        let result = if action {
+            gl.approve_mr(&project_path, mr_iid).await
+        } else {
+            gl.unapprove_mr(&project_path, mr_iid).await
+        };
+
+        match result {
             Ok(_) => {
-                self.client.show_message(MessageType::INFO, format!("MR !{mr_iid} approved.")).await;
+                let msg = if action { "approved" } else { "unapproved" };
+                self.client.show_message(MessageType::INFO, format!("MR !{mr_iid} {msg}.")).await;
                 trigger_refresh(self.client.clone(), Arc::clone(&self.state)).await;
             }
             Err(e) => {
-                tracing::warn!("approve_mr failed: {e:#}");
-                self.client.show_message(MessageType::ERROR, format!("Failed to approve MR: {e}")).await;
+                tracing::warn!("approve/unapprove failed: {e:#}");
+                self.client.show_message(MessageType::ERROR, format!("Failed: {e}")).await;
             }
         }
         Ok(None)
@@ -652,18 +742,19 @@ async fn trigger_refresh(client: Client, state: SharedState) {
             s.repo_root.clone()
         };
 
-        let (by_file, diff_refs, mr_label, diff_files) = {
+        let (by_file, diff_refs, mr_label, diff_files, head_sha, seen_files) = {
             let s = state.read().await;
             let refs = s.mr.as_ref().and_then(|m| m.diff_refs.clone());
             let label = s.mr.as_ref().map(|m| format!("MR !{}", m.iid)).unwrap_or_default();
+            let head = s.mr.as_ref().and_then(|m| m.diff_refs.as_ref()).map(|r| r.head_sha.clone()).unwrap_or_default();
             let diff_paths: HashSet<String> = s.diffs.iter().map(|d| d.new_path.clone()).collect();
-            (s.discussions_by_file.clone(), refs, label, diff_paths)
+            (s.discussions_by_file.clone(), refs, label, diff_paths, head, s.seen_files.clone())
         };
-        let changed_hint = convert::diffs_to_changed_file_diagnostics(&mr_label);
         for fp in &diff_files {
+            let is_seen = seen_files.get(fp).map(|sha| *sha == head_sha).unwrap_or(false);
             let abs = repo_root.join(fp);
             if let Ok(uri) = Url::from_file_path(&abs) {
-                let mut diags = vec![changed_hint.clone()];
+                let mut diags = vec![convert::diffs_to_changed_file_diagnostics(&mr_label, is_seen)];
                 if let Some(ds) = by_file.get(fp) {
                     diags.extend(convert::discussions_to_diagnostics(ds, fp, diff_refs.as_ref()));
                 }
@@ -725,6 +816,7 @@ impl LanguageServer for Backend {
                         "gitlab-mr.resolveThread".into(),
                         "gitlab-mr.submitInput".into(),
                         "gitlab-mr.viewDiff".into(),
+                        "gitlab-mr.markSeen".into(),
                         "gitlab-mr.approveMr".into(),
                     ],
                     ..Default::default()
@@ -903,6 +995,15 @@ impl LanguageServer for Backend {
                 "gitlab-mr.viewDiff",
                 serde_json::json!({ "file": file_path }),
             ));
+
+            let head_sha = s.mr.as_ref().and_then(|m| m.diff_refs.as_ref()).map(|r| r.head_sha.as_str()).unwrap_or("");
+            let is_seen = s.seen_files.get(&file_path).map(|s| s == head_sha).unwrap_or(false);
+            let seen_label = if is_seen { "Mark as unseen" } else { "Mark as seen" };
+            actions.push(make_command(
+                seen_label,
+                "gitlab-mr.markSeen",
+                serde_json::json!({ "file": file_path }),
+            ));
         }
 
         for thread in &threads_at_line {
@@ -942,6 +1043,7 @@ impl LanguageServer for Backend {
             "gitlab-mr.resolveThread" => self.handle_resolve(params.arguments).await,
             "gitlab-mr.submitInput" => self.handle_submit_input().await,
             "gitlab-mr.viewDiff" => self.handle_view_diff(params.arguments).await,
+            "gitlab-mr.markSeen" => self.handle_mark_seen(params.arguments).await,
             "gitlab-mr.approveMr" => self.handle_approve().await,
             _ => Ok(None),
         }
@@ -968,7 +1070,7 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let uri = params.text_document.uri;
-        let (file_path, discussions, repo_root, diff_refs, mr_label, in_diff) = {
+        let (file_path, discussions, repo_root, diff_refs, mr_label, in_diff, is_seen) = {
             let s = self.state.read().await;
             let fp = match uri_to_repo_path(&uri, &s.repo_root) {
                 Some(p) => p,
@@ -977,13 +1079,15 @@ impl LanguageServer for Backend {
             let ds = s.discussions_by_file.get(&fp).cloned().unwrap_or_default();
             let refs = s.mr.as_ref().and_then(|m| m.diff_refs.clone());
             let label = s.mr.as_ref().map(|m| format!("MR !{}", m.iid)).unwrap_or_default();
+            let head_sha = s.mr.as_ref().and_then(|m| m.diff_refs.as_ref()).map(|r| r.head_sha.clone()).unwrap_or_default();
             let in_diff = s.diffs.iter().any(|d| d.new_path == fp);
-            (fp, ds, s.repo_root.clone(), refs, label, in_diff)
+            let is_seen = s.seen_files.get(&fp).map(|sha| *sha == head_sha).unwrap_or(false);
+            (fp, ds, s.repo_root.clone(), refs, label, in_diff, is_seen)
         };
 
         let mut diags = Vec::new();
         if in_diff {
-            diags.push(convert::diffs_to_changed_file_diagnostics(&mr_label));
+            diags.push(convert::diffs_to_changed_file_diagnostics(&mr_label, is_seen));
         }
         diags.extend(convert::discussions_to_diagnostics(&discussions, &file_path, diff_refs.as_ref()));
 

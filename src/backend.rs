@@ -29,14 +29,16 @@ pub struct BackendState {
     pub line_maps: HashMap<String, BTreeMap<u32, Option<u32>>>,
     /// Track whether we've already notified the user about "no MR found".
     pub notified_no_mr: bool,
-    /// Track whether we've already warned about missing token.
-    pub notified_no_token: bool,
     /// The local HEAD SHA for which we last emitted an out-of-sync warning.
     pub last_out_of_sync_sha: Option<String>,
     /// Temp-file paths for which we have already called window/showDocument.
     pub shown_diff_paths: HashSet<PathBuf>,
     /// Pending input: path of the temp buffer the user is editing + what to do on submit.
     pub pending_input: Option<(PathBuf, PendingAction)>,
+    /// Files the user has marked as "seen", keyed by repo-relative path.
+    /// Value is the MR head SHA at the time of marking; if the MR head advances
+    /// the entry is stale and the file is treated as unseen again.
+    pub seen_files: HashMap<String, String>,
 }
 
 impl BackendState {

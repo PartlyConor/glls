@@ -206,6 +206,22 @@ impl GitLabClient {
         Ok(())
     }
 
+    pub async fn unapprove_mr(&self, project_path: &str, iid: u64) -> Result<()> {
+        let url = format!(
+            "{}/merge_requests/{iid}/unapprove",
+            self.project_url(project_path)
+        );
+        self.http
+            .post(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .send()
+            .await
+            .context("unapprove_mr request failed")?
+            .error_for_status()
+            .context("unapprove_mr returned non-2xx")?;
+        Ok(())
+    }
+
     // ── Pagination helper ─────────────────────────────────────────────────────
 
     async fn paginate<T>(&self, base_url: &str) -> Result<Vec<T>>
