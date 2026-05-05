@@ -37,6 +37,9 @@ url = "2"
 # anyhow for ergonomic error handling
 anyhow = "1"
 
+# Glob pattern matching for ignore_patterns
+glob = "0.3"
+
 # tempfile for $EDITOR flow
 tempfile = "3"
 

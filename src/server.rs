@@ -191,6 +191,11 @@ async fn refresh_loop(client: Client, state: SharedState) {
             s.diffs = diffs;
             s.discussions = discussions;
             s.rebuild_derived();
+            let head_sha = s.mr.as_ref()
+                .and_then(|m| m.diff_refs.as_ref())
+                .map(|r| r.head_sha.clone())
+                .unwrap_or_default();
+            s.apply_ignore_patterns(&head_sha);
         }
 
         // Push diagnostics
@@ -642,6 +647,59 @@ impl Backend {
         Ok(None)
     }
 
+    async fn handle_next_file(&self) -> LspResult<Option<Value>> {
+        let (repo_root, next_path) = {
+            let s = self.state.read().await;
+            let head_sha = s.mr.as_ref()
+                .and_then(|m| m.diff_refs.as_ref())
+                .map(|r| r.head_sha.as_str())
+                .unwrap_or("");
+
+            // Walk diffs in MR order; pick the first file not yet seen at this SHA.
+            let next = s.diffs.iter()
+                .map(|d| &d.new_path)
+                .find(|p| s.seen_files.get(*p).map(|sha| sha != head_sha).unwrap_or(true))
+                .cloned();
+
+            (s.repo_root.clone(), next)
+        };
+
+        match next_path {
+            None => {
+                self.client.show_message(
+                    MessageType::INFO,
+                    "gitlab-mr-lsp: all changed files reviewed.",
+                ).await;
+            }
+            Some(rel) => {
+                let abs = repo_root.join(&rel);
+                let uri = Url::from_file_path(&abs)
+                    .map_err(|_| tower_lsp::jsonrpc::Error::internal_error())?;
+                match self.client.show_document(ShowDocumentParams {
+                    uri,
+                    external: Some(false),
+                    take_focus: Some(true),
+                    selection: None,
+                }).await {
+                    Ok(true) => {
+                        self.client.show_message(
+                            MessageType::INFO,
+                            format!("Next: {rel}"),
+                        ).await;
+                    }
+                    _ => {
+                        self.client.show_message(
+                            MessageType::WARNING,
+                            format!("gitlab-mr-lsp: could not open {rel}"),
+                        ).await;
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     async fn handle_approve(&self) -> LspResult<Option<Value>> {
         let (config, project_path, mr_iid, mr_title) = {
             let s = self.state.read().await;
@@ -739,6 +797,11 @@ async fn trigger_refresh(client: Client, state: SharedState) {
             if let Ok(d) = diffs { s.diffs = d; }
             if let Ok(d) = discussions { s.discussions = d; }
             s.rebuild_derived();
+            let head_sha = s.mr.as_ref()
+                .and_then(|m| m.diff_refs.as_ref())
+                .map(|r| r.head_sha.clone())
+                .unwrap_or_default();
+            s.apply_ignore_patterns(&head_sha);
             s.repo_root.clone()
         };
 
@@ -818,6 +881,7 @@ impl LanguageServer for Backend {
                         "gitlab-mr.viewDiff".into(),
                         "gitlab-mr.markSeen".into(),
                         "gitlab-mr.approveMr".into(),
+                        "gitlab-mr.nextFile".into(),
                     ],
                     ..Default::default()
                 }),
@@ -1045,6 +1109,7 @@ impl LanguageServer for Backend {
             "gitlab-mr.viewDiff" => self.handle_view_diff(params.arguments).await,
             "gitlab-mr.markSeen" => self.handle_mark_seen(params.arguments).await,
             "gitlab-mr.approveMr" => self.handle_approve().await,
+            "gitlab-mr.nextFile" => self.handle_next_file().await,
             _ => Ok(None),
         }
     }

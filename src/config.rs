@@ -8,6 +8,9 @@ pub struct Config {
     pub gitlab_token: String,
     pub mr_iid: Option<u64>,
     pub poll_interval_secs: u64,
+    /// Glob patterns (e.g. `["**/sqlx-data.json", "Cargo.lock"]`) for files
+    /// that should be auto-marked as seen and never surfaced for review.
+    pub ignore_patterns: Vec<String>,
 }
 
 /// Schema for `.helix/mr-lsp.toml`.
@@ -17,16 +20,18 @@ struct TomlConfig {
     gitlab_token: Option<String>,
     mr_iid: Option<u64>,
     poll_interval_secs: Option<u64>,
+    #[serde(default)]
+    ignore_patterns: Vec<String>,
 }
 
 impl Config {
     /// Load configuration using the priority chain:
-    /// 1. `.helix/mr-lsp.toml` in the workspace root
+    /// 1. `~/.config/helix/mr-lsp.toml`
     /// 2. Environment variables (`GITLAB_TOKEN`, `GITLAB_HOST`)
     /// 3. Host derived from the git remote origin URL
     /// 4. `glab auth status --show-token -h <host>` (shell out)
     pub async fn load(workspace_root: Option<&PathBuf>) -> anyhow::Result<Self> {
-        let toml_cfg = load_toml_config(workspace_root);
+        let toml_cfg = load_toml_config();
 
         // --- host ---
         // Priority: toml → GITLAB_HOST env → git remote → gitlab.com fallback.
@@ -63,16 +68,18 @@ impl Config {
             gitlab_token,
             mr_iid: toml_cfg.mr_iid,
             poll_interval_secs: toml_cfg.poll_interval_secs.unwrap_or(60),
+            ignore_patterns: toml_cfg.ignore_patterns,
         })
     }
 }
 
-fn load_toml_config(workspace_root: Option<&PathBuf>) -> TomlConfig {
-    let root = match workspace_root {
-        Some(r) => r.clone(),
+fn load_toml_config() -> TomlConfig {
+    // ~/.config/helix/mr-lsp.toml
+    let path = dirs_next();
+    let path = match path {
+        Some(p) => p.join("helix").join("mr-lsp.toml"),
         None => return TomlConfig::default(),
     };
-    let path = root.join(".helix").join("mr-lsp.toml");
     let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(_) => return TomlConfig::default(),
@@ -84,6 +91,16 @@ fn load_toml_config(workspace_root: Option<&PathBuf>) -> TomlConfig {
             TomlConfig::default()
         }
     }
+}
+
+/// Returns `$XDG_CONFIG_HOME` if set, otherwise `~/.config`.
+fn dirs_next() -> Option<std::path::PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        return Some(std::path::PathBuf::from(xdg));
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".config"))
 }
 
 async fn token_from_glab(host: &str) -> anyhow::Result<String> {

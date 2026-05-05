@@ -42,7 +42,30 @@ pub struct BackendState {
 }
 
 impl BackendState {
-    /// Rebuild the derived maps from the raw discussions and diffs.
+    /// Auto-mark any diff files whose path matches a configured ignore pattern
+    /// as seen at the given `head_sha`. Existing seen entries for ignored files
+    /// are refreshed to the new SHA so they stay suppressed after a rebase/push.
+    pub fn apply_ignore_patterns(&mut self, head_sha: &str) {
+        let patterns: Vec<glob::Pattern> = self
+            .config
+            .as_ref()
+            .map(|c| c.ignore_patterns.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+
+        if patterns.is_empty() {
+            return;
+        }
+
+        for diff in &self.diffs {
+            let path = &diff.new_path;
+            if patterns.iter().any(|pat| pat.matches(path)) {
+                self.seen_files.insert(path.clone(), head_sha.to_owned());
+            }
+        }
+    }
     pub fn rebuild_derived(&mut self) {
         // discussions_by_file
         let mut by_file: HashMap<String, Vec<Discussion>> = HashMap::new();
