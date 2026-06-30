@@ -41,7 +41,50 @@ pub struct BackendState {
     pub seen_files: HashMap<String, String>,
 }
 
+/// Why review features (code actions, hover, inlay hints) are unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotReady {
+    /// No GitLab auth — token is empty or config failed to load.
+    NoAuth,
+    /// No upstream — couldn't resolve a `group/repo` project path from the remote.
+    NoUpstream,
+    /// Configured correctly, but there's no open MR for the current branch.
+    NoMr,
+}
+
+impl NotReady {
+    /// A human-readable explanation, suitable for logs and user notifications.
+    pub fn message(self) -> &'static str {
+        match self {
+            NotReady::NoAuth => {
+                "no GitLab token found — set GITLAB_TOKEN or run `glab auth login`"
+            }
+            NotReady::NoUpstream => {
+                "no GitLab upstream — could not derive a project path from the git remote `origin`"
+            }
+            NotReady::NoMr => "no open MR found for the current branch",
+        }
+    }
+}
+
 impl BackendState {
+    /// Returns `None` when review features have everything they need (auth,
+    /// upstream, and an MR loaded), or `Some(reason)` describing the first
+    /// missing prerequisite. Used to suppress code actions, hover, and inlay
+    /// hints so the workspace isn't cluttered with actions that can't succeed
+    /// (no config) or have nothing to target (no open MR).
+    pub fn review_blocker(&self) -> Option<NotReady> {
+        if self.config.as_ref().map_or(true, |c| c.gitlab_token.is_empty()) {
+            Some(NotReady::NoAuth)
+        } else if self.project_path.is_empty() {
+            Some(NotReady::NoUpstream)
+        } else if self.mr.is_none() {
+            Some(NotReady::NoMr)
+        } else {
+            None
+        }
+    }
+
     /// Auto-mark any diff files whose path matches a configured ignore pattern
     /// as seen at the given `head_sha`. Existing seen entries for ignored files
     /// are refreshed to the new SHA so they stay suppressed after a rebase/push.
@@ -92,3 +135,81 @@ impl BackendState {
 }
 
 pub type SharedState = Arc<RwLock<BackendState>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_token(token: &str) -> Config {
+        Config {
+            gitlab_host: "https://gitlab.com".to_owned(),
+            gitlab_token: token.to_owned(),
+            mr_iid: None,
+            poll_interval_secs: 60,
+            ignore_patterns: vec![],
+        }
+    }
+
+    fn dummy_mr() -> MergeRequest {
+        MergeRequest {
+            iid: 1,
+            title: "Test MR".to_owned(),
+            state: "opened".to_owned(),
+            source_branch: "feature".to_owned(),
+            target_branch: "main".to_owned(),
+            sha: "abc123".to_owned(),
+            diff_refs: None,
+            author: crate::gitlab::types::User {
+                id: 1,
+                username: "alice".to_owned(),
+                name: "Alice".to_owned(),
+            },
+        }
+    }
+
+    fn state(config: Option<Config>, project_path: &str, mr: Option<MergeRequest>) -> BackendState {
+        BackendState {
+            config,
+            project_path: project_path.to_owned(),
+            mr,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ready_when_token_project_path_and_mr_present() {
+        let s = state(Some(config_with_token("glpat-xxx")), "group/repo", Some(dummy_mr()));
+        assert_eq!(s.review_blocker(), None);
+    }
+
+    #[test]
+    fn no_auth_when_config_missing() {
+        let s = state(None, "group/repo", Some(dummy_mr()));
+        assert_eq!(s.review_blocker(), Some(NotReady::NoAuth));
+    }
+
+    #[test]
+    fn no_auth_when_token_empty() {
+        let s = state(Some(config_with_token("")), "group/repo", Some(dummy_mr()));
+        assert_eq!(s.review_blocker(), Some(NotReady::NoAuth));
+    }
+
+    #[test]
+    fn no_upstream_when_project_path_empty() {
+        let s = state(Some(config_with_token("glpat-xxx")), "", Some(dummy_mr()));
+        assert_eq!(s.review_blocker(), Some(NotReady::NoUpstream));
+    }
+
+    #[test]
+    fn no_mr_when_mr_absent() {
+        let s = state(Some(config_with_token("glpat-xxx")), "group/repo", None);
+        assert_eq!(s.review_blocker(), Some(NotReady::NoMr));
+    }
+
+    #[test]
+    fn auth_takes_priority_over_upstream_and_mr() {
+        // With nothing configured, the first missing prerequisite is reported.
+        let s = state(None, "", None);
+        assert_eq!(s.review_blocker(), Some(NotReady::NoAuth));
+    }
+}

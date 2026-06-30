@@ -8,7 +8,7 @@ use tower_lsp::jsonrpc::Result as LspResult;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{async_trait, Client, LanguageServer};
 
-use crate::backend::{BackendState, PendingAction, SharedState};
+use crate::backend::{BackendState, NotReady, PendingAction, SharedState};
 use crate::config::Config;
 use crate::convert;
 use crate::gitlab::GitLabClient;
@@ -75,7 +75,17 @@ async fn refresh_loop(client: Client, state: SharedState) {
             client
                 .show_message(
                     MessageType::WARNING,
-                    "gitlab-mr-lsp: no GitLab token found. Set GITLAB_TOKEN or run `glab auth login`. LSP will not poll.",
+                    format!("gitlab-mr-lsp: {}. LSP will not poll.", NotReady::NoAuth.message()),
+                )
+                .await;
+            return;
+        }
+
+        if project_path.is_empty() {
+            client
+                .show_message(
+                    MessageType::WARNING,
+                    format!("gitlab-mr-lsp: {}. LSP will not poll.", NotReady::NoUpstream.message()),
                 )
                 .await;
             return;
@@ -961,6 +971,10 @@ impl LanguageServer for Backend {
         let gitlab_line = lsp_line + 1; // GitLab is 1-indexed
 
         let s = self.state.read().await;
+        if let Some(blocker) = s.review_blocker() {
+            tracing::debug!("hover suppressed: {}", blocker.message());
+            return Ok(None);
+        }
         let file_path = match uri_to_repo_path(uri, &s.repo_root) {
             Some(p) => p,
             None => return Ok(None),
@@ -1011,6 +1025,11 @@ impl LanguageServer for Backend {
         params: CodeActionParams,
     ) -> LspResult<Option<CodeActionResponse>> {
         let s = self.state.read().await;
+        // No auth / upstream / MR → don't surface review actions that can't succeed.
+        if let Some(blocker) = s.review_blocker() {
+            tracing::debug!("code action suppressed: {}", blocker.message());
+            return Ok(None);
+        }
         let line = params.range.start.line + 1; // 1-indexed for GitLab
         let file_path = match uri_to_repo_path(&params.text_document.uri, &s.repo_root) {
             Some(p) => p,
@@ -1118,6 +1137,10 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> LspResult<Option<Vec<InlayHint>>> {
         let s = self.state.read().await;
+        if let Some(blocker) = s.review_blocker() {
+            tracing::debug!("inlay hints suppressed: {}", blocker.message());
+            return Ok(Some(vec![]));
+        }
         let file_path = match uri_to_repo_path(&params.text_document.uri, &s.repo_root) {
             Some(p) => p,
             None => return Ok(Some(vec![])),
